@@ -9,6 +9,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    environment: attendance
 
     steps:
       - name: Checkout
