@@ -2,8 +2,10 @@ name: Scrape Attendance
 
 on:
   schedule:
-    - cron: "30 5-12 * * *"   # daily at 03:00 UTC — adjust as needed
-  workflow_dispatch: {}    # lets you trigger it manually from the Actions tab
+    # Runs hourly, 11:00–18:00 IST, every day
+    # IST = UTC+5:30, so 11:00–18:00 IST = 05:30–12:30 UTC
+    - cron: "30 5-12 * * *"
+  workflow_dispatch: {}   # allows manual trigger from the Actions tab
 
 jobs:
   scrape:
@@ -11,7 +13,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,10 +28,10 @@ jobs:
         uses: browser-actions/setup-chrome@v1
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: uv sync
 
       - name: Run scraper
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           DB_NAME: ${{ secrets.DB_NAME }}
-        run: python main.py
+        run: uv run python main.py
