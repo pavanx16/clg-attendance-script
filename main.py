@@ -1,17 +1,18 @@
 """
-attendance_scraper.py
-======================
-Scrapes the Attendance System, handles React dropdowns, filters out
-zero-attendance/undefined rows, computes overall stats using two methods,
-and saves to a formatted Excel file.
+Attendance System Scraper with MongoDB Atlas Integration
+
+Scrapes the Attendance System for multiple users stored in MongoDB Atlas,
+handles React dropdowns, filters out zero-attendance/undefined rows,
+and stores results directly in MongoDB with username extracted from email.
 """
+from dotenv import load_dotenv
 
 import os
 import re
 import sys
 import time
-
-import pandas as pd
+import logging
+from datetime import datetime, timezone
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -20,36 +21,72 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, ElementClickInterceptedException
 from webdriver_manager.chrome import ChromeDriverManager
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
-# --------------------------------------------------------------------------
-# CONFIG -- edit these before running
-# --------------------------------------------------------------------------
+load_dotenv()
+
+# ==================== LOGGING SETUP ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ==================== CONFIG ====================
 BASE_URL = "https://attendence-system-1910.vercel.app"
 LOGIN_URL = f"{BASE_URL}/users/login"
+HEADLESS = True  # Set to True for GitHub Actions
+WAIT_TIMEOUT = 20  # seconds to wait for each page/element to appear
 
-HEADLESS = False         # keep False for your first run so you can watch it work
-WAIT_TIMEOUT = 20        # seconds to wait for each page/element to appear
-OUTPUT_FILE = "attendance_report.xlsx"
+# MongoDB Atlas configuration from environment variables
+MONGODB_URI = os.getenv("MONGODB_URI")
+DB_NAME = os.getenv("DB_NAME", "attendance_db")
+USERS_COLLECTION = "users"
+ATTENDANCE_RESULTS_COLLECTION = "attendance_results"
 
+# Optional: Filter by specific filters (set to None to skip)
 COURSE = None
 BATCH = None
 DIVISION = None
 SEMESTER = None
-# --------------------------------------------------------------------------
 
-def get_credentials():
-    """Read credentials from environment variables."""
-    email = os.getenv("ATTENDANCE_EMAIL")
-    password = os.getenv("ATTENDANCE_PASSWORD")
-
-    if not email or not password:
+# ==================== MONGODB SETUP ====================
+def connect_mongodb():
+    """Connect to MongoDB Atlas."""
+    if not MONGODB_URI:
         raise RuntimeError(
-            "Missing credentials. Set ATTENDANCE_EMAIL and ATTENDANCE_PASSWORD."
+            "Missing MONGODB_URI. Set it as an environment variable."
         )
+    try:
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        # Verify connection
+        client.admin.command('ping')
+        logger.info("✓ Connected to MongoDB Atlas")
+        return client
+    except PyMongoError as e:
+        logger.error(f"✗ MongoDB connection failed: {e}")
+        raise
 
-    return email, password
+def get_users_from_mongodb(db):
+    """Fetch all active users from MongoDB."""
+    users_collection = db[USERS_COLLECTION]
+    users = list(users_collection.find({"status": "active"}))
 
+    if not users:
+        logger.warning("No active users found in MongoDB")
+        return []
+
+    logger.info(f"Found {len(users)} active user(s)")
+    return users
+
+def extract_username_from_email(email):
+    """Extract username from email (part before @)."""
+    return email.split('@')[0]
+
+# ==================== SELENIUM SETUP ====================
 def build_driver():
+    """Build and return a Selenium WebDriver."""
     options = Options()
     if HEADLESS:
         options.add_argument("--headless=new")
@@ -58,20 +95,23 @@ def build_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--log-level=3")
+
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=options)
 
 def xpath_quote(s):
+    """XPath string quoting helper."""
     if "'" not in s:
         return f"'{s}'"
     parts = s.split("'")
-    return "concat('" + "', \"'\", '".join(parts) + "')"
+    return "concat('" + "', \"'\"" + ", '".join(parts) + "')"
 
 def find_button(driver, text):
+    """Find button by text."""
     return driver.find_element(By.XPATH, f"//button[normalize-space()={xpath_quote(text)}]")
 
 def safe_click(driver, element):
-    """Fallback click if normal click is intercepted by overlays or React renders."""
+    """Fallback click if normal click is intercepted."""
     try:
         driver.execute_script("arguments[0].scrollIntoView(true);", element)
         element.click()
@@ -99,7 +139,6 @@ def set_dropdown_if_specified(driver, wait, label_text, value):
             )
         )
     )
-
     safe_click(driver, option)
     time.sleep(0.6)
 
@@ -120,15 +159,15 @@ def get_subject_names(driver, wait):
         if text and text.lower() != "none" and text not in subjects:
             subjects.append(text)
 
-    # Close the React dropdown by clicking the selector again.
-    # Using ESC can leave some React dropdown implementations in a
-    # state where the next Selenium click does not open the menu correctly.
+    # Close the dropdown
     safe_click(driver, container)
     time.sleep(0.5)
 
     return subjects
 
+# ==================== LOGIN & SCRAPING ====================
 def login(driver, wait, email, password):
+    """Login to the attendance system."""
     driver.get(LOGIN_URL)
     email_input = wait.until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "input[placeholder='john@gmail.com'], input[type='email']"))
@@ -146,10 +185,12 @@ def login(driver, wait, email, password):
         wait.until(EC.presence_of_element_located(
             (By.XPATH, "//button[normalize-space()='Your Attendances']")
         ))
+        logger.info(f"  ✓ Logged in as {email}")
     except TimeoutException:
-        raise RuntimeError("Login failed. Check credentials or site status.")
+        raise RuntimeError(f"Login failed for {email}. Check credentials or site status.")
 
 def open_subject_selector(driver, wait):
+    """Open the subject selector page."""
     find_button(driver, "Your Attendances").click()
     wait.until(EC.presence_of_element_located(
         (By.XPATH, "//*[contains(text(),'Select Subject For Attendance')]")
@@ -157,6 +198,7 @@ def open_subject_selector(driver, wait):
     time.sleep(3)
 
 def extract_summary(body_text):
+    """Extract attendance summary from page text."""
     patterns = {
         "Subject": r"Subject:\s*(.+)",
         "Total Attendances": r"Total Attendances:\s*([a-zA-Z0-9]+)",
@@ -170,16 +212,16 @@ def extract_summary(body_text):
     return row
 
 def scrape_one_subject(driver, wait, subject_name):
+    """Scrape attendance for a single subject."""
     set_dropdown_if_specified(driver, wait, "Select Course", COURSE)
     set_dropdown_if_specified(driver, wait, "Select Batch", BATCH)
     set_dropdown_if_specified(driver, wait, "Select Division", DIVISION)
     set_dropdown_if_specified(driver, wait, "Select Semester", SEMESTER)
-
     set_dropdown_if_specified(driver, wait, "Select Subjects", subject_name)
 
     find_button(driver, "View Attendance").click()
 
-    # Wait until the page loads the specific subject's name in the text
+    # Wait until the page loads
     wait.until(lambda d: subject_name.lower() in d.find_element(By.TAG_NAME, "body").text.lower())
 
     body_text = driver.find_element(By.TAG_NAME, "body").text
@@ -189,184 +231,265 @@ def scrape_one_subject(driver, wait, subject_name):
     wait.until(EC.presence_of_element_located(
         (By.XPATH, "//*[contains(text(),'Select Subject For Attendance')]")
     ))
-    time.sleep(1) # stabilization pause
+    time.sleep(1)
+
     return row
 
-def build_excel(rows, path):
-    # Initialize DataFrame with scraped data
-    df = pd.DataFrame(rows, columns=["Subject", "Total Attendances", "Total Present", "Percentage"])
+# ==================== DATA PROCESSING & MONGODB STORAGE ====================
+def clean_and_validate_data(rows):
+    """Clean scraped data and remove invalid entries."""
+    cleaned_rows = []
 
-    # Convert data types to string temporarily for cleanup processing
-    for col in df.columns:
-        df[col] = df[col].astype(str)
+    for row in rows:
+        # Skip if any critical field is missing or undefined
+        if not all([row.get("Subject"), row.get("Total Attendances"), row.get("Total Present")]):
+            continue
 
-    # 1. Clean data: Drop undefined or missing rows
-    df = df[~df["Subject"].str.lower().isin(["undefined", "none", "nan", ""])]
-    df = df[~df["Total Attendances"].str.lower().isin(["undefined", "none", "nan", ""])]
-    df = df[~df["Total Present"].str.lower().isin(["undefined", "none", "nan", ""])]
+        if any(val and isinstance(val, str) and val.lower() in ["undefined", "none", "nan", ""] for val in row.values()):
+            continue
 
-    # 2. Convert to numeric for calculations
-    df["Total Attendances_num"] = pd.to_numeric(df["Total Attendances"], errors='coerce')
-    df["Total Present_num"] = pd.to_numeric(df["Total Present"], errors='coerce')
+        # Convert to numeric for validation
+        try:
+            total_attendances = int(row["Total Attendances"])
+            total_present = int(row["Total Present"])
 
-    df = df.dropna(subset=["Total Attendances_num", "Total Present_num"])
+            # Skip if either is 0
+            if total_attendances == 0 or total_present == 0:
+                continue
 
-    # 3. Filter out rows where Total Attendances or Total Present is 0
-    df = df[(df["Total Attendances_num"] > 0) & (df["Total Present_num"] > 0)].copy()
+            # Convert percentage string to float
+            percentage_str = row.get("Percentage", "0%")
+            if isinstance(percentage_str, str) and percentage_str.endswith("%"):
+                percentage = float(percentage_str.rstrip("%"))
+            else:
+                percentage = float(percentage_str or 0)
 
-    if df.empty:
-        print("\nAll subjects were filtered out (undefined or 0 attendance). No Excel file generated.")
-        return
+            cleaned_rows.append({
+                "subject": row["Subject"],
+                "total_attendances": total_attendances,
+                "total_present": total_present,
+                "percentage": percentage
+            })
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Could not convert data for subject {row.get('Subject')}: {e}")
+            continue
 
-    # Keep only the original target columns and convert to proper types
-    df = df[["Subject", "Total Attendances", "Total Present", "Percentage"]].copy()
-    df["Total Attendances"] = df["Total Attendances"].astype(int)
-    df["Total Present"] = df["Total Present"].astype(int)
+    return cleaned_rows
 
-    # Save to Excel with proper formatting
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Attendance")
-        ws = writer.book["Attendance"]
+def calculate_stats(cleaned_rows):
+    """Calculate overall statistics."""
+    if not cleaned_rows:
+        return None
 
-        # Freeze header row
-        ws.freeze_panes = "A2"
+    total_attendances = sum(row["total_attendances"] for row in cleaned_rows)
+    total_present = sum(row["total_present"] for row in cleaned_rows)
 
-        # Add auto filter
-        ws.auto_filter.ref = ws.dimensions
+    if total_attendances == 0:
+        overall_percentage = 0
+    else:
+        overall_percentage = round((total_present / total_attendances) * 100, 2)
 
-        # Set column widths
-        widths = {"A": 48, "B": 20, "C": 18, "D": 15}
-        for col, width in widths.items():
-            ws.column_dimensions[col].width = width
+    # Calculate average percentage across all subjects
+    avg_percentage = round(sum(row["percentage"] for row in cleaned_rows) / len(cleaned_rows), 2)
 
-    # Now apply styling and add totals row using openpyxl
-    from openpyxl import load_workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
+    return {
+        "total_attendances": total_attendances,
+        "total_present": total_present,
+        "overall_percentage": overall_percentage,
+        "avg_percentage": avg_percentage,
+        "subjects_count": len(cleaned_rows)
+    }
 
-    wb = load_workbook(path)
-    ws = wb["Attendance"]
-    last_row = ws.max_row
-    total_row = last_row + 2
+def save_to_mongodb(db, username, email, cleaned_rows, stats):
+    """Save attendance results to MongoDB."""
+    results_collection = db[ATTENDANCE_RESULTS_COLLECTION]
 
-    # Add TOTAL/AVERAGE row
-    ws.cell(total_row, 1, "TOTAL / AVERAGE")
-    ws.cell(total_row, 2, f"=SUM(B2:B{last_row})")
-    ws.cell(total_row, 3, f"=SUM(C2:C{last_row})")
-    ws.cell(total_row, 4, f"=AVERAGE(D2:D{last_row})")
+    document = {
+        "username": username,
+        "email": email,
+        "scraped_at": datetime.now(timezone.utc),
+        "subjects": cleaned_rows,
+        "statistics": stats,
+        "total_subjects_scraped": len(cleaned_rows)
+    }
 
-    # Convert percentage strings to numeric percentages so Excel can average them correctly
-    for row in range(2, last_row + 1):
-        cell = ws.cell(row, 4)
-        if isinstance(cell.value, str) and cell.value.endswith("%"):
-            cell.value = float(cell.value[:-1]) / 100
-            cell.number_format = "0.00%"
+    try:
+        result = results_collection.insert_one(document)
+        logger.info(f"  ✓ Stored results for {username} (ID: {result.inserted_id})")
+        return result.inserted_id
+    except PyMongoError as e:
+        logger.error(f"  ✗ Failed to store results for {username}: {e}")
+        raise
 
-    # Format header row
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_alignment = Alignment(horizontal="center", vertical="center")
+# ==================== MAIN SCRAPING WORKFLOW ====================
+def scrape_user(driver, db, user):
+    """
+    Scrape attendance for a single user.
 
-    thin_border = Border(
-        left=Side(style='thin'),
-        right=Side(style='thin'),
-        top=Side(style='thin'),
-        bottom=Side(style='thin')
-    )
+    Stored document structure:
+    {
+        "username": "student1",
+        "email": "student1@gmail.com",
+        "scraped_at": "2024-01-20T...",
+        "subjects": [
+            {
+                "subject": "Mathematics",
+                "total_attendances": 30,
+                "total_present": 28,
+                "percentage": 93.33
+            }
+        ],
+        "statistics": {
+            "total_attendances": 100,
+            "total_present": 92,
+            "overall_percentage": 92.0,
+            "avg_percentage": 90.5,
+            "subjects_count": 3
+        }
+    }
+    """
+    email = user.get("email")
+    password = user.get("password")
+    username = extract_username_from_email(email)
 
-    for cell in ws[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_alignment
-        cell.border = thin_border
+    logger.info(f"\n--- Scraping user: {username} ({email}) ---")
 
-    # Format data rows with alternating colors and borders
-    alt_row_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    if not email or not password:
+        logger.error(f"✗ User {username} missing email or password")
+        return False
 
-    for row_idx in range(2, last_row + 1):
-        for col_idx in range(1, 5):
-            cell = ws.cell(row_idx, col_idx)
-            cell.border = thin_border
-
-            # Alternate row colors
-            if (row_idx - 2) % 2 == 1:
-                cell.fill = alt_row_fill
-
-            # Apply alignment based on column
-            if col_idx == 1:  # Subject
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-            elif col_idx in [2, 3]:  # Numbers
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            elif col_idx == 4:  # Percentage
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # Format total row
-    total_font = Font(bold=True, size=11)
-    total_fill = PatternFill(start_color="D9EAF7", end_color="D9EAF7", fill_type="solid")
-    total_alignment = Alignment(horizontal="center", vertical="center")
-
-    for col_idx in range(1, 5):
-        cell = ws.cell(total_row, col_idx)
-        cell.font = total_font
-        cell.fill = total_fill
-        cell.border = thin_border
-
-        if col_idx == 1:  # Subject label
-            cell.alignment = Alignment(horizontal="left", vertical="center")
-        else:
-            cell.alignment = total_alignment
-
-        # Apply percentage format to average cell
-        if col_idx == 4:
-            cell.number_format = "0.00%"
-
-    wb.save(path)
-    print(f"\nFiltered and saved successfully to {os.path.abspath(path)}")
-
-def main():
-    email, password = get_credentials()
-    driver = build_driver()
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     results = []
 
     try:
-        print("Logging in...")
+        # Login
         login(driver, wait, email, password)
 
-        print("Opening subject selector...")
+        # Open subject selector
         open_subject_selector(driver, wait)
 
+        # Set filters if specified
         set_dropdown_if_specified(driver, wait, "Select Course", COURSE)
         set_dropdown_if_specified(driver, wait, "Select Batch", BATCH)
         set_dropdown_if_specified(driver, wait, "Select Division", DIVISION)
         set_dropdown_if_specified(driver, wait, "Select Semester", SEMESTER)
 
+        # Get all subjects
         subjects = get_subject_names(driver, wait)
-        print(f"Found {len(subjects)} subject(s): {', '.join(subjects)}")
+        logger.info(f"  Found {len(subjects)} subject(s)")
 
+        # Scrape each subject
         for subject in subjects:
-            print(f"  Scraping '{subject}'...")
+            logger.info(f"    Scraping: {subject}")
             for attempt in range(2):
                 try:
                     row = scrape_one_subject(driver, wait, subject)
                     results.append(row)
-                    print(f"    -> {row}")
                     break
                 except StaleElementReferenceException:
                     if attempt == 1:
                         raise
                     continue
                 except Exception as e:
-                    print(f"    !! Skipped '{subject}': {e}")
+                    logger.warning(f"    ⚠ Skipped '{subject}': {e}")
                     break
-    finally:
-        driver.quit()
 
-    if not results:
-        print("No data was scraped -- nothing to save.")
+        if not results:
+            logger.warning(f"✗ No data scraped for {username}")
+            return False
+
+        # Clean data
+        cleaned_rows = clean_and_validate_data(results)
+        if not cleaned_rows:
+            logger.warning(f"✗ All subjects filtered out for {username}")
+            return False
+
+        # Calculate stats
+        stats = calculate_stats(cleaned_rows)
+        logger.info(f"  Statistics: {stats['subjects_count']} subjects, "
+                   f"{stats['overall_percentage']}% attendance")
+
+        # Save to MongoDB
+        save_to_mongodb(db, username, email, cleaned_rows, stats)
+
+        return True
+
+    except Exception as e:
+        logger.error(f"✗ Error scraping {username}: {e}")
+        return False
+
+def main():
+    """Main function to orchestrate the scraping of all users."""
+    # Connect to MongoDB
+    try:
+        client = connect_mongodb()
+        db = client[DB_NAME]
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {e}")
         sys.exit(1)
 
-    build_excel(results, OUTPUT_FILE)
+    # Get users from MongoDB
+    try:
+        users = get_users_from_mongodb(db)
+        if not users:
+            logger.error("No users to scrape")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to fetch users: {e}")
+        sys.exit(1)
+
+    # IMPORTANT:
+    # Create a completely fresh Chrome session for EVERY user.
+    #
+    # Reusing one Selenium driver between users can leak browser state
+    # (cookies, localStorage, React state, navigation state, etc.) from the
+    # previous account. That is the main reason the second user can fail
+    # even though login succeeds.
+    successful = 0
+    failed = 0
+
+    try:
+        for index, user in enumerate(users, start=1):
+            email = user.get("email", "<unknown>")
+            driver = None
+            user_success = False
+
+            logger.info(f"\n========== USER {index}/{len(users)} ==========")
+
+            try:
+                # Fresh browser/session for this user.
+                driver = build_driver()
+                user_success = scrape_user(driver, db, user)
+
+            except Exception as e:
+                logger.error(f"Exception for user {email}: {e}")
+
+            finally:
+                # Always destroy the browser before moving to the next user.
+                # This guarantees that the next account starts clean.
+                if driver is not None:
+                    try:
+                        driver.quit()
+                    except Exception as e:
+                        logger.warning(f"Could not close browser for {email}: {e}")
+
+            if user_success:
+                successful += 1
+                logger.info(f"✓ User completed successfully: {email}")
+            else:
+                failed += 1
+                logger.error(f"✗ User failed: {email}")
+
+            # Small delay between completely independent browser sessions.
+            if index < len(users):
+                time.sleep(2)
+
+    finally:
+        client.close()
+        logger.info(f"\n=== COMPLETE ===")
+        logger.info(f"Successful: {successful}")
+        logger.info(f"Failed: {failed}")
+        logger.info(f"Total: {successful + failed}")
 
 if __name__ == "__main__":
     main()
