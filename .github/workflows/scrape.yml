@@ -1,0 +1,31 @@
+name: Scrape Attendance
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # daily at 03:00 UTC — adjust as needed
+  workflow_dispatch: {}    # lets you trigger it manually from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: python main.py
