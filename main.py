@@ -84,7 +84,7 @@ def extract_username_from_email(email):
     """Extract username from email (part before @)."""
     return email.split('@')[0]
 
-# ==================== SELENIUM SETUP ====================
+# ==================== SELENIUM SETUP ===================="
 def build_driver():
     """Build and return a Selenium WebDriver."""
     options = Options()
@@ -301,7 +301,7 @@ def calculate_stats(cleaned_rows):
     }
 
 def save_to_mongodb(db, username, email, cleaned_rows, stats):
-    """Save attendance results to MongoDB."""
+    """Insert new attendance result or update existing result for the user."""
     results_collection = db[ATTENDANCE_RESULTS_COLLECTION]
 
     document = {
@@ -314,9 +314,38 @@ def save_to_mongodb(db, username, email, cleaned_rows, stats):
     }
 
     try:
-        result = results_collection.insert_one(document)
-        logger.info(f"  ✓ Stored results for {username} (ID: {result.inserted_id})")
-        return result.inserted_id
+        # Find existing result for this user.
+        existing = results_collection.find_one({
+            "email": email
+        })
+
+        if existing:
+            # User already exists -> UPDATE existing document.
+            result = results_collection.update_one(
+                {"_id": existing["_id"]},
+                {
+                    "$set": document
+                }
+            )
+
+            logger.info(
+                f"  ✓ Updated results for {username} "
+                f"({result.modified_count} document updated)"
+            )
+
+            return existing["_id"]
+
+        else:
+            # User does not exist -> INSERT new document.
+            result = results_collection.insert_one(document)
+
+            logger.info(
+                f"  ✓ Added new results for {username} "
+                f"(ID: {result.inserted_id})"
+            )
+
+            return result.inserted_id
+
     except PyMongoError as e:
         logger.error(f"  ✗ Failed to store results for {username}: {e}")
         raise
