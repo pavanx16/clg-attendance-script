@@ -2,9 +2,7 @@ name: Scrape Attendance
 
 on:
   schedule:
-    # 11:17 AM - 6:17 PM IST every day
-    # IST = UTC+5:30
-    - cron: "17 5-12 * * *"
+    - cron: "40 5-12 * * *"
 
   workflow_dispatch:
 
@@ -14,6 +12,12 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Test schedule
+        run: |
+          echo "Scheduled workflow started"
+          date -u
+          date
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
