@@ -2,7 +2,7 @@ name: Scrape Attendance
 
 on:
   schedule:
-    - cron: "40 5-12 * * *"
+    - cron: "45 5-12 * * *"
 
   workflow_dispatch:
 
