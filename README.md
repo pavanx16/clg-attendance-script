@@ -1,3 +1,4 @@
+[![Scrape Attendance](https://github.com/pavanx16/clg-attendance-script/actions/workflows/scrape.yml/badge.svg?event=schedule)](https://github.com/pavanx16/clg-attendance-script/actions/workflows/scrape.yml)
 # Attendance Scraper
 
 A Python scraper that logs into the attendance system, reads attendance data for active users from MongoDB, and stores the results back in MongoDB.
