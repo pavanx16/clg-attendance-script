@@ -1,9 +1,6 @@
 name: Scrape Attendance
 
 on:
-  schedule:
-    - cron: "45 5-12 * * *"
-
   workflow_dispatch:
 
 jobs:
@@ -14,7 +11,7 @@ jobs:
     steps:
       - name: Test schedule
         run: |
-          echo "Scheduled workflow started"
+          echo "Workflow started"
           date -u
           date
 
