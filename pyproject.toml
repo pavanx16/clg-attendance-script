@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=3.0.5",
     "pymongo>=4.17.0",
     "python-dotenv>=1.2.3",
+    "ruff>=0.16.6",
     "selenium>=4.47.0",
     "webdriver-manager>=4.1.2",
 ]
